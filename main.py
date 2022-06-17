@@ -1,92 +1,113 @@
 import json
-import os
+from datetime import datetime
 
 import requests
 from dotenv import load_dotenv
 
+from auth import bearer_auth
+from config import Config
+from constants import USE_SOCIAL_QUERY, LAST_SEVEN_DAYS_TOKEN_QUERY
+from db_connection import db
+
 load_dotenv()
 
-bearer_token = os.environ.get("BEARER_TOKEN")
+# https://twittercommunity.com/t/all-of-my-searches-return-only-140-character-tweets/158449
+
+db.execute_query(USE_SOCIAL_QUERY)
+
+author_id_dict = {}
 
 
-def bearer_oauth(r):
-    r.headers["Authorization"] = f"Bearer {bearer_token}"
-    r.headers["User-Agent"] = "v2FilteredStreamPython"
-    return r
+def get_rows():
+    """
+    This will fetch all the token from the last seven days
+    :return:
+    """
+    return db.fetchall(LAST_SEVEN_DAYS_TOKEN_QUERY)
 
 
-def get_rules():
-    response = requests.get(
-        "https://api.twitter.com/2/tweets/search/stream/rules", auth=bearer_oauth
-    )
-    if response.status_code != 200:
-        raise Exception(f"Cannot get rules (HTTP {response.status_code}): {response.text}")
-
-    print(json.dumps(response.json()))
+def get_recent_search(auth, params):
+    """
+    This will make request to the twitter's recent search API and return the response
+    :param auth:
+    :param params:
+    :return:
+    """
+    response = requests.get("https://api.twitter.com/2/tweets/search/recent", auth=auth, params=params)
     return response.json()
 
 
-def set_rules():
+def add_to_dict(response, symbol):
     """
-    I am using the context operator here with the domain id and entity_id,
-    To retrieve tweets of a specific person we can also specify that via "from" or "@" operator
+    This function will add author data to the dictionary, increment the count id the author data is already available
+    :param response:
+    :param symbol:
+    :return:
     """
-    sample_rules = [
-        {"value": "context:165.1001503516555337728 -is:retweet", "tag": "Blockchain"},
-        {"value": "context:131.1007360414114435072 OR context:174.1007360414114435072", "tag": "Bitcoin cryptocurrency"},
-        {"value": "context:131.1007361429752594432 OR context:174.1007361429752594432", "tag": "Ethereum cryptocurrency"},
-        {"value": "context:131.1293666530111008769 -is:retweet", "tag": "Instagram influencers"},
-    ]
-    payload = {"add": sample_rules}
-    response = requests.post(
-        "https://api.twitter.com/2/tweets/search/stream/rules",
-        auth=bearer_oauth,
-        json=payload,
-    )
-    if response.status_code != 201:
-        raise Exception(f"Cannot add rules (HTTP {response.status_code}): {response.text}")
-
-    print(json.dumps(response.json()))
+    for data in response.get('data', []):
+        if author_id_dict.get(data.get('author_id')):
+            if symbol not in author_id_dict[data.get('author_id')]['tokens']:
+                author_id_dict[data.get('author_id')]['tokens'].append(symbol)
+            author_id_dict[data.get('author_id')]['count'] += 1
+        else:
+            author_id_dict[data.get('author_id')] = {'count': 1, 'tokens': []}
+            author_id_dict[data.get('author_id')]['tokens'].append(symbol)
 
 
-def delete_all_rules(rules):
-    if rules is None or "data" not in rules:
-        return None
+def fetch_tweets():
+    """
+    This will fetch the tweets data based in the query, start_time and end_time
+    :return:
+    """
+    rows = get_rows()
 
-    ids = list(map(lambda rule: rule["id"], rules["data"]))
-    payload = {"delete": {"ids": ids}}
-    response = requests.post(
-        "https://api.twitter.com/2/tweets/search/stream/rules",
-        auth=bearer_oauth,
-        json=payload
-    )
-    if response.status_code != 200:
-        raise Exception(f"Cannot delete rules (HTTP {response.status_code}): {response.text}")
+    for row in rows:
+        symbol = row[0].strip().replace(' ', '')
+        name = row[1].strip().replace(' ', '')
+        query_params = {'query': f'("#{symbol}" OR "#{name}" OR "${symbol}" OR "${name}") (context:165.1001503516555337728 OR context:131.1007361429752594432 OR context:174.1007361429752594432) -is:retweet',
+                        'start_time': f"{datetime.fromtimestamp(int(row[2])).isoformat()}Z",
+                        'end_time': f"{datetime.fromtimestamp(int(row[2]) + 3600).isoformat()}Z",
+                        'tweet.fields': 'author_id,created_at,public_metrics',
+                        'max_results': 100}
+        response = get_recent_search(auth=bearer_auth.token, params=query_params)
+        if response.get('errors'):
+            if 'end_time' in str(response.get('errors')):
+                query_params.pop('end_time')
+            response = get_recent_search(auth=bearer_auth.token, params=query_params)
 
-    print(json.dumps(response.json()))
+        add_to_dict(response, symbol)
+
+        # Below code is commented temporarily, to not exhaust the monthly tweet quota, because it finds the next_token
+        # from the response and fetches all the tweets that methods the query until
+
+        # while response.get('meta').get('next_token'):
+        #     query_params['next_token'] = response.get('meta').get('next_token')
+        #     response = get_recent_search(auth=bearer_auth.token, params=query_params)
+        #     add_to_dict(response, symbol)
 
 
-def get_stream():
-    params = {'tweet.fields': 'author_id'}
-    response = requests.get(
-        "https://api.twitter.com/2/tweets/search/stream", auth=bearer_oauth, stream=True, params=params
-    )
-    print(response.status_code)
-    if response.status_code != 200:
-        raise Exception(f"Cannot get stream (HTTP {response.status_code}): {response.text}")
+def store_to_json(data):
+    """
+    This function stores the data to the json file to see the fetched data
+    :param data:
+    :return:
+    """
+    with open('author.json', 'w') as fp:
+        json.dump(data, fp)
 
-    for response_line in response.iter_lines():
-        if response_line:
-            json_response = json.loads(response_line)
-            json_object = json.dumps(json_response, indent=4, sort_keys=True)
-            print(json_object)
-            with open("tweets.json", "a") as f:
-                f.write(json_object)
-                f.write(',\n')
+
+def get_alpha_hunter():
+    """
+    This function will call the fetch_tweet function and then call the store_to_json function and at last it loads the
+    data from the json file and check for the alpha hunters based on the given criteria
+    :return:
+    """
+    fetch_tweets()
+    store_to_json(author_id_dict)
+    with open('author.json', 'r') as file:
+        json_data = json.load(file)
+        return [data for data in json_data if len(json_data.get(data).get('tokens')) > Config.ALPHA_FINDER_CRITERIA]
 
 
 if __name__ == "__main__":
-    # set_rules()
-    # rules = get_rules()
-    # delete_all_rules(rules)
-    get_stream()
+    alpha_hunters = get_alpha_hunter()
